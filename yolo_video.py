@@ -2,8 +2,56 @@ import os
 import sys
 import shutil
 import time
+import cv2
+import numpy as np
 from pathlib import Path
 from ultralytics import YOLO
+
+
+def filter_cat_detections(boxes, min_conf=0.85, min_size=50, min_aspect=0.5, max_aspect=2.0):
+    """
+    Фильтрует обнаружения кошек, убирая ложные срабатывания (игрушки и т.д.)
+    
+    Параметры:
+        min_conf: минимальная уверенность (по умолчанию 0.85)
+        min_size: минимальная ширина/высота в пикселях (по умолчанию 50)
+        min_aspect: минимальное соотношение сторон (w/h)
+        max_aspect: максимальное соотношение сторон (w/h)
+    
+    Возвращает:
+        Отфильтрованный список боксов
+    """
+    filtered = []
+    
+    for box in boxes:
+        cls = int(box.cls[0]) if hasattr(box, 'cls') else int(box.cls)
+        conf = float(box.conf[0]) if hasattr(box, 'conf') else float(box.conf)
+        
+        # Проверяем класс (cat = 15 в COCO)
+        if cls != 15:
+            continue
+        
+        # Получаем координаты
+        xyxy = box.xyxy[0].cpu().numpy() if hasattr(box.xyxy, 'cpu') else box.xyxy[0]
+        x1, y1, x2, y2 = xyxy
+        w, h = x2 - x1, y2 - y1
+        
+        # Проверяем размер
+        if w < min_size or h < min_size:
+            continue
+        
+        # Проверяем соотношение сторон
+        aspect_ratio = w / h
+        if aspect_ratio < min_aspect or aspect_ratio > max_aspect:
+            continue
+        
+        # Проверяем уверенность
+        if conf < min_conf:
+            continue
+        
+        filtered.append(box)
+    
+    return filtered
 
 
 def process_videos():
@@ -64,6 +112,12 @@ def process_videos():
     # Класс "cat" в COCO - номер 15
     CAT_CLASS = 15
     
+    # Параметры фильтрации для устранения ложных срабатываний
+    FILTER_MIN_CONF = 0.85    # Минимальная уверенность
+    FILTER_MIN_SIZE = 50       # Минимальный размер (пикселей)
+    FILTER_MIN_ASPECT = 0.5    # Минимальное соотношение сторон (w/h)
+    FILTER_MAX_ASPECT = 2.0    # Максимальное соотношение сторон (w/h)
+    
     # Обрабатываем каждое видео
     for video_path in sorted(video_files):
         filename = video_path.name
@@ -77,49 +131,112 @@ def process_videos():
                 error_count += 1
                 continue
             
-            # Удаляем папку runs перед обработкой
-            if Path("runs").exists():
-                try:
-                    shutil.rmtree("runs", ignore_errors=True)
-                except:
-                    pass
+            # Открываем видео для покадровой обработки
+            cap = cv2.VideoCapture(str(video_path))
+            if not cap.isOpened():
+                print(f"   ❌ Ошибка: не удалось открыть видео")
+                error_count += 1
+                continue
             
-            time.sleep(0.5)  # Даём время на удаление
+            # Получаем параметры видео
+            fps = int(cap.get(cv2.CAP_PROP_FPS))
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             
-            # Обрабатываем видео с фильтрацией только кошек (класс 15)
-            results = model(
-                source=str(video_path),
-                conf=0.75,
-                save=True,
-                project="runs/detect",
-                name="temp",
-                exist_ok=True,
-                classes=[CAT_CLASS],  # Только кошки
-                verbose=False  # Отключаем покадровый вывод
-            )
+            # Создаём VideoWriter для сохранения результата
+            output_path = result_dir / f"{video_path.stem}.mp4"
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
             
-            # Получаем путь сохранения
-            if results and len(results) > 0:
-                save_dir = results[0].save_dir
+            frame_idx = 0
+            cats_found = 0
+            frames_processed = 0
+            
+            # Трекинг: запоминаем последнюю обнаруженную позицию кошки
+            last_valid_box = None
+            last_valid_conf = 0.0
+            frames_since_last_detection = 0
+            MAX_FRAMES_WITHOUT_DETECTION = 60  # Увеличили до 60 кадров (~2 секунды при 30fps)
+            
+            print(f"   📹 Видео: {width}x{height}, {fps} fps, {total_frames} кадров")
+            
+            # Обрабатываем каждый кадр
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    break
                 
-                if save_dir:
-                    save_path = Path(save_dir)
-                    if save_path.exists():
-                        # Ищем AVI файл (YOLO сохраняет видео как AVI)
-                        avi_files = list(save_path.glob("*.avi"))
-                        if avi_files:
-                            for avi_file in avi_files:
-                                # Меняем расширение на mp4
-                                mp4_name = avi_file.stem + ".mp4"
-                                dest_path = result_dir / mp4_name
-                                # Копируем файл
-                                shutil.copy2(avi_file, dest_path)
-                                print(f"   ✅ Сохранено: {mp4_name}")
-                        else:
-                            print(f"   ⚠️  Не найден AVI файл в: {save_path}")
-                    else:
-                        print(f"   ⚠️ Директория не существует: {save_path}")
+                frame_idx += 1
+                
+                # Обрабатываем каждый кадр
+                results = model(frame, conf=0.75, verbose=False)
+                
+                # Применяем фильтры для устранения ложных срабатываний
+                has_valid_detection = False
+                
+                for r in results:
+                    boxes = r.boxes
+                    if boxes is not None and len(boxes) > 0:
+                        # Фильтруем обнаружения
+                        filtered_boxes = filter_cat_detections(
+                            boxes,
+                            min_conf=FILTER_MIN_CONF,
+                            min_size=FILTER_MIN_SIZE,
+                            min_aspect=FILTER_MIN_ASPECT,
+                            max_aspect=FILTER_MAX_ASPECT
+                        )
+                        
+                        if len(filtered_boxes) > 0:
+                            cats_found += 1
+                            has_valid_detection = True
+                            frames_since_last_detection = 0
+                            
+                            # Берём первое обнаружение (самое уверенное)
+                            box = filtered_boxes[0]
+                            last_valid_box = box.xyxy[0].cpu().numpy()
+                            last_valid_conf = float(box.conf[0])
+                            
+                            # Рисуем боксы на кадре
+                            for box in filtered_boxes:
+                                xyxy = box.xyxy[0].cpu().numpy()
+                                conf = float(box.conf[0])
+                                
+                                x1, y1, x2, y2 = map(int, xyxy)
+                                
+                                # Рисуем одну толстую оранжевую рамку
+                                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 165, 255), 8)
+                                
+                                # Добавляем подпись
+                                label = f"Cat: {conf:.2f}"
+                                cv2.putText(frame, label, (x1, y1 - 10), 
+                                           cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 165, 255), 3)
+                
+                # Трекинг: если нет валидной детекции, используем последнюю известную позицию
+                if not has_valid_detection and last_valid_box is not None:
+                    frames_since_last_detection += 1
+                    if frames_since_last_detection <= MAX_FRAMES_WITHOUT_DETECTION:
+                        # Рисуем одну толстую рамку
+                        x1, y1, x2, y2 = map(int, last_valid_box)
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 165, 255), 8)
+                        label = f"Cat: {last_valid_conf:.2f}"
+                        cv2.putText(frame, label, (x1, y1 - 10), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 165, 255), 3)
+                
+                # Записываем кадр в выходное видео
+                out.write(frame)
+                frames_processed += 1
+                
+                # Показываем прогресс
+                if frame_idx % 30 == 0:
+                    print(f"   ⏳ Обработано кадров: {frame_idx}/{total_frames}")
             
+            # Освобождаем ресурсы
+            cap.release()
+            out.release()
+            
+            print(f"   ✅ Найдено кошек в {cats_found} кадрах")
+            print(f"   ✅ Сохранено: {output_path.name}")
             print(f"   ✅ Успешно обработано: {filename}")
             success_count += 1
             
